@@ -123,21 +123,14 @@ class VersionRequestHandler(BaseHTTPRequestHandler):
         else:
             self._not_found()
 
-    # api.md：其他路径/方法 → 404
-    def do_HEAD(self):
-        self._not_found()
-
-    def do_POST(self):
-        self._not_found()
-
-    def do_PUT(self):
-        self._not_found()
-
-    def do_DELETE(self):
-        self._not_found()
-
-    def do_PATCH(self):
-        self._not_found()
+    def __getattr__(self, name):
+        # api.md：其他路径/方法 → 404——除 GET 外的任意方法（OPTIONS/TRACE/
+        # CONNECT/自定义方法等）统一兜底 404，不落入 BaseHTTPRequestHandler
+        # 未实现方法的默认 501 分支；仅在常规属性查找未命中时触发，
+        # 已定义的 do_GET 等路由不受影响。
+        if name.startswith("do_"):
+            return self._not_found
+        raise AttributeError(name)
 
     def log_message(self, fmt, *args):  # 一行/请求，仅 stderr，不落盘
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))

@@ -256,9 +256,16 @@ class RouteTests(unittest.TestCase):
 
     def test_non_get_methods_return_404(self):
         for method, path in (("POST", "/version"), ("PUT", "/health"),
-                             ("DELETE", "/"), ("PATCH", "/version")):
-            status, _headers, _body = self._request(path, method=method)
+                             ("DELETE", "/"), ("PATCH", "/version"),
+                             ("HEAD", "/health"), ("OPTIONS", "/version"),
+                             ("OPTIONS", "/health"), ("TRACE", "/health"),
+                             ("CONNECT", "/version"), ("FOOBAR", "/health"),
+                             ("RELAY-PILOT", "/version")):
+            status, _headers, body = self._request(path, method=method)
             self.assertEqual(status, 404, "%s %s" % (method, path))
+            if method != "HEAD":  # HEAD 按 RFC 不携带响应体
+                self.assertEqual(body, b"not found",
+                                 "%s %s" % (method, path))
 
     def test_service_writes_no_files(self):
         before = _list_files(self.payload_root)
