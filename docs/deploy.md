@@ -150,7 +150,7 @@ args = [
     "--store", "/home/codexops/relay-pilot/artifacts",
     "--image", "relay-pilot-version-svc",
     "--image-cmd", '["python3","/app/src/version_svc.py","18080","0.0.0.0"]',
-    "--expect-digest", "sha256:<构建登记的 artifact_digest>",
+    "--expect-digest", "<构建登记的 artifact_digest>",
     "--base-image", "python:3.12-slim",
 ]
 print(" ".join(shlex.quote(a) for a in args))
@@ -160,6 +160,11 @@ PY
 # 2) 远端命令作为本地单个参数传入；目录包字节经 ssh stdin 传输（互不干扰）
 ssh -o BatchMode=yes <transport> "$REMOTE_CMD" < <release_id>.tar.gz
 ```
+
+`--expect-digest` **原样传入**构建 stdout JSON 里的 `artifact_digest` 值
+（该值本身已带 `sha256:` 前缀，如 `sha256:<64hex>`）；装运脚本的摘要闸门
+是逐字比对、不做归一化，不要再额外加前缀——填成
+`sha256:sha256:<64hex>` 之类双前缀会把正确制品误判为 `digest-mismatch`。
 
 不建议手写两层引用（例如把整条远端命令放进本地双引号、再对 JSON 参数内嵌
 远端单引号）：引号嵌套、转义与换行都极易出错——双引号内的**裸换行**会被
@@ -233,8 +238,10 @@ deploy 返回 `DEPLOYED` 后，协调器发起 `operation: verify`（用同一 r
 
 1. **不比对 `release_id`**——观察窗口判定只看 `source_sha` 与
    `artifact_digest`，不校验运行中的版本就是本次目标 release（结果 JSON 的
-   `actual_release_id`/`actual_sha`/`actual_digest` 来自真实探测，是否等于
-   目标身份需由调用方自行核对）；
+   `actual_release_id` / `actual_sha` / `actual_artifact_digest` 来自真实
+   探测，需由调用方分别核对等于目标的 `release_id` / `release_sha` /
+   `artifact_digest`；注意摘要字段名是 `actual_artifact_digest`，不是
+   `actual_digest`）；
 2. **不调用 `/health`**——`/health` 只在 deploy 阶段的容器健康等待中使用
    （见 §4.3）。
 
@@ -292,7 +299,7 @@ docker images relay-pilot-version-svc
 | 入口 exit `3` 或结果 `UNKNOWN` | 内部故障/断线，远端状态不可知 | **先发 `operation: status` 对账**；确认当前运行版本再决定续跑或回滚，绝不重复执行切换 |
 | deploy 失败 `port already allocated` 类 | 旧容器占用宿主 18080 | 入口回滚路径已内置"先停失败版本容器再启 previous"；手动处置时先 `docker stop relay-pilot-version-svc-<失败release_id>` |
 | `/health` 超时（健康等待 60s 内不通） | 容器启动失败、端口映射不符 | `docker logs relay-pilot-version-svc-<release_id>` 看服务 stderr（每请求一行日志）；核对容器 `18080->18080` 映射 |
-| 重试 deploy 提示 request-hash-conflict | 同 `idempotency_key`/身份与账本既有记录不一致 | 属于防重复切换的保护；换新 `idempotency_key` 并确认 release 身份后再发 |
+| deploy/verify 提示 `request-hash-conflict`（结果 `retryable=false`） | 业务身份冲突：该 `release_id` 在账本已绑定**不同业务指纹**（`operation` / `release_sha` / `artifact_digest` / `profile_hash` / `expected_current_release_id` / `previous_release_id` 任一不同即冲突；`idempotency_key` **不在指纹内**，换键不改变指纹） | **换新 `idempotency_key` 解决不了指纹冲突**。先 `operation: status` 对账，按报错里的冲突字段把请求业务字段恢复成与既有记录一致（完全一致的原样重放会幂等返回既有结果）；确实要发布不同制品/配置时，用**新 `release_id`** 走完整发布流程，不得改写既有 release |
 
 通用原则：任何情况下不要绕过入口直接 `docker run`/手改账本；所有判断以
 结构化结果（`DeploymentResult` JSON、HTTP 探测）为准，stderr 文本不作成功
