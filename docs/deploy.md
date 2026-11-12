@@ -130,16 +130,48 @@ TG3 环境：Ubuntu 24.04 x86_64，`codexops` 用户，docker（containerd 存�
 ### 4.2 装运（协调端 → TG3，ssh stdin）
 
 装运工具：`agent-relay` 仓 `relay/tools/pack_remote_image.py`（在**目标机本机**
-执行，Python 3.10+ 纯标准库）。协调器经 ssh 通道调用，**目录包字节经 stdin 传入**：
+执行，Python 3.10+ 纯标准库）。协调器经 ssh 通道调用，**目录包字节经 stdin 传入**。
+
+注意 ssh 命令经过**两层 shell 解析**：本地 shell 先解析一次；ssh 随后把远端命令
+各参数用空格拼接成单个字符串，交由**远端 shell** 二次解析。因此含空格或引号的
+参数（典型是 `--image-cmd` 的 JSON 数组）必须再做一层**远端引用**——若只在本地
+层加单引号，该引号会被本地 shell 消耗，远端 shell 将剥掉 JSON 内的双引号，
+`json.loads` 失败，装运脚本以 `image-cmd-invalid` 拒绝，根本进不了摘要闸门。
+推荐用 `shlex.quote` 逐参数生成远端命令，引用由机器保证：
 
 ```bash
-ssh -o BatchMode=yes <transport> python3 <TG3>/relay/tools/pack_remote_image.py \
-    --release-id RELAY-20261110-01 \
-    --store /home/codexops/relay-pilot/artifacts \
-    --image relay-pilot-version-svc \
-    --image-cmd '["python3","/app/src/version_svc.py","18080","0.0.0.0"]' \
-    --expect-digest sha256:<构建登记的 artifact_digest> \
-    --base-image python:3.12-slim \
+# 1) 生成远端命令（shlex.quote 保证每个参数经远端 shell 解析后逐字还原）
+REMOTE_CMD=$(python3 - <<'PY'
+import shlex
+args = [
+    "python3", "<TG3>/relay/tools/pack_remote_image.py",
+    "--release-id", "RELAY-20261110-01",
+    "--store", "/home/codexops/relay-pilot/artifacts",
+    "--image", "relay-pilot-version-svc",
+    "--image-cmd", '["python3","/app/src/version_svc.py","18080","0.0.0.0"]',
+    "--expect-digest", "sha256:<构建登记的 artifact_digest>",
+    "--base-image", "python:3.12-slim",
+]
+print(" ".join(shlex.quote(a) for a in args))
+PY
+)
+
+# 2) 远端命令作为本地单个参数传入；目录包字节经 ssh stdin 传输（互不干扰）
+ssh -o BatchMode=yes <transport> "$REMOTE_CMD" < <release_id>.tar.gz
+```
+
+等价的手写两层引用形式——整条远端命令放在本地双引号内作为**一个**参数，
+JSON 参数再用远端层单引号包裹，JSON 内的双引号对本地层转义为 `\"`：
+
+```bash
+ssh -o BatchMode=yes <transport> \
+  "python3 <TG3>/relay/tools/pack_remote_image.py
+    --release-id RELAY-20261110-01
+    --store /home/codexops/relay-pilot/artifacts
+    --image relay-pilot-version-svc
+    --image-cmd '[\"python3\",\"/app/src/version_svc.py\",\"18080\",\"0.0.0.0\"]'
+    --expect-digest sha256:<构建登记的 artifact_digest>
+    --base-image python:3.12-slim" \
   < <release_id>.tar.gz
 ```
 
@@ -241,6 +273,7 @@ docker images relay-pilot-version-svc
 | 本地裸仓库 `/version` 500，正文 `release-info.json 不可用` | 预期行为：源码树无 `release-info.json`（构建期生成物） | 无需处置；需完整验证时按第 2 节解包构建产物运行 |
 | 线上 `/version` 500，正文含 `declared`/`actual` | 运行制品与 `release-info.json` 声明摘要不符——payload 文件被改动/组装错误/混入未排除文件 | 核对镜像内 `/app` 内容与构建产物；重新构建并按链路重发，勿手改容器内文件 |
 | 装运返回 `digest-mismatch` | ssh 传输包体损坏、`--expect-digest` 与制品不配、源码快照与构建登记漂移 | 以构建 stdout 登记的 `artifact_digest` 为准重装运；仍不符则回查快照来源 |
+| 装运 rc=2 且结果 `image-cmd-invalid`（或远端参数被拆散） | ssh 远端 shell 二次解析剥掉了参数引用——`--image-cmd` JSON 内双引号被去、含空格参数被拆分 | 按 §4.2 用 `shlex.quote` 生成远端命令；可先在本地 `shlex.split(远端命令串)` 复核远端将收到的 argv |
 | 装运 `docker-build-failed` / `docker-save-failed` | 目标机 docker 异常、基础镜像 `python:3.12-slim` 缺失、磁盘不足 | 看 ssh stderr 里捕获的 docker 输出末尾行；在 TG3 本机排查 docker 状态 |
 | 入口 exit `2`（输入非法） | schema/环境 ID/profile_hash/release_id 字符集/deadline 无时区不通过 | 按报错修请求字段后重发（换新 `idempotency_key`）；profile 变更需重取 `--print-profile-hash` |
 | 入口 exit `3` 或结果 `UNKNOWN` | 内部故障/断线，远端状态不可知 | **先发 `operation: status` 对账**；确认当前运行版本再决定续跑或回滚，绝不重复执行切换 |
