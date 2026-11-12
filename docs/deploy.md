@@ -35,7 +35,8 @@
     ──▶ <store>/<release_id>.tar（镜像 tar）
     ──DeploymentRequest stdin──▶ ~/relay-pilot/bin/relay_trusted_entry.py
     ──▶ 容器 relay-pilot-version-svc-<release_id>（镜像 relay-pilot-version-svc:<release_id>）
-    ──▶ 127.0.0.1:18080 /version + /health 核实 → VERIFIED
+    ──▶ 入口 verify：观察窗口多轮探 /version（比 source_sha/artifact_digest）→ VERIFIED
+    ──▶ 验收补充核对：/version 三元组（含 release_id）+ /health ok（第 5 节）
 ```
 
 ---
@@ -196,9 +197,10 @@ python3 ~/relay-pilot/bin/relay_trusted_entry.py \
 - profile `~/relay-pilot/profiles/pilot-tg3-docker.json`（`profile_id:
   pilot-tg3-docker`，`environment_id: pilot-tg3`，`runtime: docker`）：服务名
   `relay-pilot-version-svc`，宿主绑定 `127.0.0.1:18080`（容器端口同为
-  18080），探测 `http://127.0.0.1:18080/version` 与 `/health`，健康等待
-  60s，观察窗口 120s（间隔 10s），`rollback_enabled: true`，
-  `migration_policy: none`。
+  18080）。两组探测 URL 用途不同：`/health`（`health_urls`）只在 deploy
+  阶段做容器健康等待（60s，间隔 2s，要求正文 `ok`）；`/version`
+  （`version_urls`）用于 deploy 版本确认与 verify 观察窗口（120s，间隔
+  10s）。另：`rollback_enabled: true`，`migration_policy: none`。
 - `profile_hash` = profile 文件字节 sha256，用
   `python3 ~/relay-pilot/bin/relay_trusted_entry.py --profile \
   ~/relay-pilot/profiles/pilot-tg3-docker.json --print-profile-hash` 获取。
@@ -220,9 +222,25 @@ python3 ~/relay-pilot/bin/relay_trusted_entry.py \
 ### 4.4 核实与收尾
 
 deploy 返回 `DEPLOYED` 后，协调器发起 `operation: verify`（用同一 release
-身份与 `release_sha`）：入口在 120 秒观察窗口内多轮探测
-`http://127.0.0.1:18080/version`，每轮三元组与请求身份一致且 `/health` 通过
-才记 `VERIFIED`。线上人工核实方法见第 5 节。
+身份、`release_sha` 与 `artifact_digest`）。**verify 的实际核验范围**：入口
+在 120 秒观察窗口内每 10 秒探测 `http://127.0.0.1:18080/version`，每轮要求
+响应有效（HTTP 200 且含合法 `source_sha`/`artifact_digest`）、`source_sha`
+与请求逐字一致、`artifact_digest` 归一化后一致（`sha256:` 前缀与裸十六进制
+视为相等）；全部轮次通过才记 `VERIFIED`，窗口被 deadline 截断不判
+`VERIFIED`。
+
+注意两点 **verify 不做的事**：
+
+1. **不比对 `release_id`**——观察窗口判定只看 `source_sha` 与
+   `artifact_digest`，不校验运行中的版本就是本次目标 release（结果 JSON 的
+   `actual_release_id`/`actual_sha`/`actual_digest` 来自真实探测，是否等于
+   目标身份需由调用方自行核对）；
+2. **不调用 `/health`**——`/health` 只在 deploy 阶段的容器健康等待中使用
+   （见 §4.3）。
+
+因此 **`VERIFIED` ≠ 完整业务验收**：完成验收前必做第 5 节的人工核对
+（`/version` 三元组与登记身份逐字一致 + `/health` 返回 `200 ok`），入口
+verify 结果不能替代这些检查。断线/异常后先用 `status` 对账再决定动作。
 
 ---
 
@@ -254,6 +272,9 @@ docker images relay-pilot-version-svc
   stdout 登记值）。
 - `/version` 返回 `500` = 运行制品自校验失败（见第 6 节），不得视为已部署。
 - 协议级核实走入口 `verify` 操作（观察窗口 120 秒多轮一致才 `VERIFIED`），
+  但 verify 只比 `source_sha`/`artifact_digest`，不比对 `release_id`、不探
+  `/health`（见 §4.4）——上方 1)/2)/3) 的人工核对（三元组逐字一致 +
+  `/health` 200 `ok`）是完成业务验收前的必做补充，不能以 `VERIFIED` 替代。
   断线/异常后先用 `status` 对账再决定动作。
 
 ---
