@@ -15,6 +15,10 @@
     uptime 每请求实算、缺 release-info/坏 JSON → 500 且响应体为 api.md
     约定错误对象 {"error": "release-info unavailable"}、非对象/篡改→500、
     未知路径与非 GET 方法→404、不落盘。
+  * X-Relay-Release（TestRelayReleaseHeader）：/health 与 /version 的 200
+    分支头值 = release_id（每请求实读）、500 与 404 分支及 /buildinfo 无
+    该头、/health 在 release-info 失败时仍 200 ok 且无该头、响应体与其余
+    响应头字节级回归、release_id 不能安全入头时省略、不落盘。
 """
 import hashlib
 import importlib.util
@@ -431,6 +435,196 @@ class TestBuildinfoEndpoint(unittest.TestCase):
         # 时钟回拨钳 0
         self.assertEqual(version_svc._uptime_seconds(
             start - timedelta(seconds=30)), 0)
+
+
+class TestRelayReleaseHeader(unittest.TestCase):
+    """X-Relay-Release：仅 /health 与 /version 的 200 分支携带，值 = release_id。"""
+
+    HEADER = "X-Relay-Release"
+
+    def setUp(self):
+        self.payload_root = tempfile.mkdtemp(prefix="version-svc-header-")
+        self._reset_payload()
+        self.server = ThreadingHTTPServer(
+            ("127.0.0.1", 0), version_svc.build_payload_root(self.payload_root))
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       daemon=True)
+        self.thread.start()
+        self.addCleanup(shutil.rmtree, self.payload_root, ignore_errors=True)
+        self.addCleanup(self._stop_server)
+
+    def _stop_server(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+    def _reset_payload(self, **release_info_kwargs):
+        """把 payload 复原为自洽基线（子用例间撤销篡改/损坏）。"""
+        _make_payload_tree(self.payload_root)
+        self.release_info = _write_release_info(
+            self.payload_root, _reference_digest(self.payload_root),
+            **release_info_kwargs)
+
+    def _release_info_path(self):
+        return os.path.join(self.payload_root, "release-info.json")
+
+    def _break_missing(self):
+        os.remove(self._release_info_path())
+
+    def _break_unparseable(self):
+        with open(self._release_info_path(), "wb") as fh:
+            fh.write('{"release_id": 缺引号}'.encode("utf-8"))
+
+    def _break_non_object(self):
+        with open(self._release_info_path(), "wb") as fh:
+            fh.write(b"[1, 2]")
+
+    def _break_tampered(self):
+        with open(os.path.join(self.payload_root, "app.py"), "ab") as fh:
+            fh.write(b"# tampered\n")
+
+    def _break_deeply_nested(self):
+        # release_info 只兜 OSError/ValueError；深嵌套 JSON 抛 RecursionError
+        with open(self._release_info_path(), "wb") as fh:
+            fh.write(b"[" * 100000 + b"]" * 100000)
+
+    def _breakages(self):
+        return (("missing", self._break_missing),
+                ("unparseable", self._break_unparseable),
+                ("non-object", self._break_non_object),
+                ("tampered", self._break_tampered),
+                ("deeply-nested", self._break_deeply_nested))
+
+    def _request(self, path, method="GET"):
+        request = urllib.request.Request(
+            "http://127.0.0.1:%d%s" % (self.port, path), method=method)
+        try:
+            with _OPENER.open(request, timeout=10) as resp:
+                return resp.status, resp.headers, resp.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.headers, exc.read()
+
+    def test_health_header_equals_release_id(self):
+        status, headers, _body = self._request("/health")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get_all(self.HEADER),
+                         [self.release_info["release_id"]])
+
+    def test_version_header_equals_release_id(self):
+        status, headers, body = self._request("/version")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get_all(self.HEADER),
+                         [self.release_info["release_id"]])
+        # 头值与同一响应体里的 release_id 一致（同一次 release_info() 读取）
+        self.assertEqual(headers[self.HEADER],
+                         json.loads(body.decode("utf-8"))["release_id"])
+
+    def test_header_follows_release_info_per_request(self):
+        # 每请求实读：release-info 换版后头值随之变化，而非启动时缓存
+        self._reset_payload(release_id="RELAY-UNIT-20261111-02")
+        for path in ("/health", "/version", "/health?probe=1"):
+            status, headers, _body = self._request(path)
+            self.assertEqual(status, 200, path)
+            self.assertEqual(headers[self.HEADER],
+                             "RELAY-UNIT-20261111-02", path)
+
+    def test_version_500_branches_have_no_header(self):
+        for label, break_payload in self._breakages():
+            with self.subTest(label):
+                self._reset_payload()
+                break_payload()
+                if label == "deeply-nested":
+                    # /version 的既有行为：release_info 未兜住的 RecursionError
+                    # 击穿该请求（连接重置，非 500），本任务不改此口径；
+                    # 仅在 test_health_stays_ok... 守护 /health 不被牵连
+                    continue
+                status, headers, _body = self._request("/version")
+                self.assertEqual(status, 500)
+                self.assertIsNone(headers[self.HEADER])
+
+    def test_health_stays_ok_without_header_when_release_info_fails(self):
+        for label, break_payload in self._breakages():
+            with self.subTest(label):
+                self._reset_payload()
+                break_payload()
+                status, headers, body = self._request("/health")
+                self.assertEqual(status, 200)
+                self.assertEqual(body, b"ok")
+                self.assertIsNone(headers[self.HEADER])
+
+    def test_404_branches_have_no_header(self):
+        for method, path in (("GET", "/nope"), ("GET", "/"),
+                             ("GET", "/health/extra"), ("GET", "/version/"),
+                             ("POST", "/version"), ("PUT", "/health"),
+                             ("HEAD", "/health"), ("OPTIONS", "/version")):
+            status, headers, _body = self._request(path, method=method)
+            self.assertEqual(status, 404, "%s %s" % (method, path))
+            self.assertIsNone(headers[self.HEADER], "%s %s" % (method, path))
+
+    def test_buildinfo_has_no_header(self):
+        status, headers, _body = self._request("/buildinfo")
+        self.assertEqual(status, 200)
+        self.assertIsNone(headers[self.HEADER])
+        self._break_missing()
+        status, headers, _body = self._request("/buildinfo")
+        self.assertEqual(status, 500)
+        self.assertIsNone(headers[self.HEADER])
+
+    def test_response_bodies_and_other_headers_unchanged(self):
+        status, headers, body = self._request("/health")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"ok")
+        self.assertEqual(headers["Content-Type"], "text/plain; charset=utf-8")
+        self.assertEqual(headers["Content-Length"], "2")
+        self.assertEqual(headers["Cache-Control"], "no-cache")
+
+        status, headers, body = self._request("/version")
+        self.assertEqual(status, 200)
+        # 字节级回归：键序与序列化口径保持原样
+        expected = json.dumps({
+            "release_id": self.release_info["release_id"],
+            "source_sha": self.release_info["source_sha"],
+            "artifact_digest": self.release_info["artifact_digest"],
+            "built_at": self.release_info["built_at"],
+        }, ensure_ascii=False).encode("utf-8")
+        self.assertEqual(body, expected)
+        self.assertEqual(headers["Content-Type"],
+                         "application/json; charset=utf-8")
+        self.assertEqual(headers["Content-Length"], str(len(expected)))
+        self.assertEqual(headers["Cache-Control"], "no-cache")
+
+    def test_unsafe_release_id_omits_header_and_keeps_200(self):
+        # release_id 不能安全入头时省略该头，原有 200 响应不受影响
+        for release_id in (None, 42, "", "发布-01", "r1\r\nX-Injected: 1"):
+            with self.subTest(release_id=release_id):
+                self._reset_payload(release_id=release_id)
+                status, headers, body = self._request("/version")
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(body.decode("utf-8")),
+                                 self.release_info)
+                self.assertIsNone(headers[self.HEADER])
+                self.assertIsNone(headers["X-Injected"])
+                status, headers, body = self._request("/health")
+                self.assertEqual(status, 200)
+                self.assertEqual(body, b"ok")
+                self.assertIsNone(headers[self.HEADER])
+                self.assertIsNone(headers["X-Injected"])
+
+    def test_release_header_value_helper(self):
+        value = version_svc._release_header_value
+        self.assertEqual(value({"release_id": "RELAY-UNIT-20261111-01"}),
+                         "RELAY-UNIT-20261111-01")
+        for info in (None, {}, {"release_id": None}, {"release_id": 42},
+                     {"release_id": ""}, {"release_id": "发布-01"},
+                     {"release_id": "r1\nr2"}, {"release_id": "r1\x7f"}):
+            self.assertIsNone(value(info), info)
+
+    def test_header_requests_write_no_files(self):
+        before = _list_files(self.payload_root)
+        for path in ("/health", "/version"):
+            self._request(path)
+        self.assertEqual(_list_files(self.payload_root), before)
 
 
 class MainArgvTests(unittest.TestCase):

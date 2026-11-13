@@ -5,6 +5,8 @@
 以子进程真实起服验证 GET /health、GET /version 与 GET /buildinfo：
 payload 布局与真实制品一致（payload 根 = src/ 上级，release-info.json
 在 payload 根上，artifact_digest 为构建侧口径的摘要），argv 传端口。
+/health 与 /version 的 200 响应断言 X-Relay-Release = release_id，
+404/500 分支断言无该头。
 本目录是 required 检查 integration 的 discover 起点。
 """
 import json
@@ -84,14 +86,41 @@ class VersionSvcIntegrationSmoke(unittest.TestCase):
 
         with _OPENER.open(base_url + "/health", timeout=5) as resp:
             self.assertEqual(resp.status, 200)
+            self.assertEqual(resp.getheader("X-Relay-Release"),
+                             release_info["release_id"])
             self.assertEqual(resp.read(), b"ok")
 
         with _OPENER.open(base_url + "/version", timeout=5) as resp:
             self.assertEqual(resp.status, 200)
             self.assertEqual(resp.getheader("Content-Type"),
                              "application/json; charset=utf-8")
+            self.assertEqual(resp.getheader("X-Relay-Release"),
+                             release_info["release_id"])
             self.assertEqual(json.loads(resp.read().decode("utf-8")),
                              release_info)
+
+    def test_release_header_absent_on_error_branches_over_real_subprocess(self):
+        payload_root, _release_info = self._make_payload()
+        base_url = self._start_subprocess(payload_root)
+
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            _OPENER.open(base_url + "/nope", timeout=5)
+        self.addCleanup(ctx.exception.close)
+        self.assertEqual(ctx.exception.code, 404)
+        self.assertIsNone(ctx.exception.headers["X-Relay-Release"])
+
+        os.remove(os.path.join(payload_root, "release-info.json"))
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            _OPENER.open(base_url + "/version", timeout=5)
+        self.addCleanup(ctx.exception.close)
+        self.assertEqual(ctx.exception.code, 500)
+        self.assertIsNone(ctx.exception.headers["X-Relay-Release"])
+
+        # /health 不因版本文件缺失而降级：仍 200 ok，只是不带该头
+        with _OPENER.open(base_url + "/health", timeout=5) as resp:
+            self.assertEqual(resp.status, 200)
+            self.assertIsNone(resp.getheader("X-Relay-Release"))
+            self.assertEqual(resp.read(), b"ok")
 
     def test_buildinfo_over_real_subprocess(self):
         _payload_root, release_info = self._make_payload()
