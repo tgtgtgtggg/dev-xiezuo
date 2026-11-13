@@ -3,11 +3,17 @@
 """src/version_svc.py — relay 试点版本服务（纯标准库，DEV-33 sample-app 同构）。
 
 路由：
-  GET /health  → 200 "ok"（不触碰版本文件——健康即进程可服务）
-  GET /version → 200 JSON {release_id, source_sha, artifact_digest, built_at}
-                 版本证据只读 payload 根 release-info.json，且每次请求对
-                 payload 根重算 content-manifest 摘要自校验，不符 → 500
-                 （版本被篡改/组装错误的可观测信号，solution §10）
+  GET /health   → 200 "ok"（不触碰版本文件——健康即进程可服务）
+  GET /version  → 200 JSON {release_id, source_sha, artifact_digest, built_at}
+                  版本证据只读 payload 根 release-info.json，且每次请求对
+                  payload 根重算 content-manifest 摘要自校验，不符 → 500
+                  （版本被篡改/组装错误的可观测信号，solution §10）
+  GET /buildinfo → 200 JSON {release_id, source_sha, built_at} 加运行时字段
+                  {service_start_iso, uptime_seconds, python_version}；三元组
+                  与 /version 共用同一 release_info() 读取/自校验路径（缺失/
+                  不可解析/摘要不符同口径 → 500，其中缺失/不可解析按 api.md
+                  返回约定错误对象，/version 仍回原详细错误对象），键按字母序
+                  紧凑输出
   其他路径/方法 → 404
 
 摘要口径与 tools/build_artifact.py、entry/relay_trusted_entry.py 一致：
@@ -24,15 +30,22 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import sys
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MANIFEST_SCHEMA = "relay-artifact-manifest/1"
 MANIFEST_EXCLUDE = {"MANIFEST.json", "release-info.json"}
 DEFAULT_PORT = 18080
 DEFAULT_HOST = "127.0.0.1"
+# api.md：/buildinfo 对 release-info.json 缺失/不可解析返回的约定错误对象
+BUILDINFO_UNAVAILABLE_ERROR = {"error": "release-info unavailable"}
 # payload 根 = src/ 的上级目录（仓库内运行即仓库根；容器内即 /app）
 PAYLOAD_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# 进程启动时刻（模块加载时一次采样，UTC）；/buildinfo 的 service_start_iso/
+# uptime_seconds 以此为基准，仅存在于内存，不落盘
+SERVICE_START = datetime.now(timezone.utc)
 
 
 def _sha256_file(path):
@@ -67,6 +80,52 @@ def load_release_info(payload_root):
         return json.load(handle)
 
 
+class ReleaseInfoError(Exception):
+    """release-info 读取/自校验失败；payload 即 500 响应的 JSON 对象。
+
+    unavailable=True 标记缺失/不可解析一类：api.md 规定 /buildinfo 对此类
+    返回约定错误对象 BUILDINFO_UNAVAILABLE_ERROR，/version 与其余失败类
+    （非对象/摘要不符）仍回详细 payload，原行为不变。
+    """
+
+    def __init__(self, payload, unavailable=False):
+        super().__init__(payload.get("error", "release-info 不可用"))
+        self.payload = payload
+        self.unavailable = unavailable
+
+
+def release_info(payload_root):
+    """读取 release-info.json 并对 payload 根重算摘要自校验。
+
+    /version 与 /buildinfo 共用的唯一版本证据路径：缺失/不可解析/非对象/
+    摘要不符 → 抛 ReleaseInfoError（由 handler 捕获按 500 返回）。
+    """
+    try:
+        info = load_release_info(payload_root)
+    except (OSError, ValueError) as exc:
+        raise ReleaseInfoError(
+            {"error": "release-info.json 不可用: " + str(exc)},
+            unavailable=True) from exc
+    if not isinstance(info, dict):
+        raise ReleaseInfoError({"error": "release-info.json 不是 JSON 对象"})
+    try:
+        actual = compute_manifest_digest(payload_root)
+    except OSError as exc:
+        raise ReleaseInfoError(
+            {"error": "payload 摘要计算失败: " + str(exc)}) from exc
+    declared = info.get("artifact_digest")
+    # 版本证据必须来自运行制品本身；不一致视为制品被篡改/组装错误
+    if actual != declared:
+        raise ReleaseInfoError({"error": "release-info 与实际制品不一致",
+                                "declared": declared, "actual": actual})
+    return info
+
+
+def _uptime_seconds(now):
+    """相对 SERVICE_START 的整数秒（每请求实算；时钟回拨钳 0）。"""
+    return max(0, int((now - SERVICE_START).total_seconds()))
+
+
 class VersionRequestHandler(BaseHTTPRequestHandler):
     server_version = "relay-pilot-version-svc/1.0"
     payload_root = PAYLOAD_ROOT  # build_payload_root 工厂按注入覆盖
@@ -84,31 +143,43 @@ class VersionRequestHandler(BaseHTTPRequestHandler):
         self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"),
                    "application/json; charset=utf-8")
 
+    def _send_json_sorted(self, code, obj):
+        # /buildinfo 200 口径：键字母序 + 紧凑分隔；/version 序列化保持不变
+        self._send(code, json.dumps(obj, ensure_ascii=False, sort_keys=True,
+                                    separators=(",", ":")).encode("utf-8"),
+                   "application/json; charset=utf-8")
+
     def _handle_version(self):
         try:
-            info = load_release_info(self.payload_root)
-        except (OSError, ValueError) as exc:
-            self._send_json(500, {"error": "release-info.json 不可用: " + str(exc)})
-            return
-        if not isinstance(info, dict):
-            self._send_json(500, {"error": "release-info.json 不是 JSON 对象"})
-            return
-        try:
-            actual = compute_manifest_digest(self.payload_root)
-        except OSError as exc:
-            self._send_json(500, {"error": "payload 摘要计算失败: " + str(exc)})
-            return
-        declared = info.get("artifact_digest")
-        # 版本证据必须来自运行制品本身；不一致视为制品被篡改/组装错误
-        if actual != declared:
-            self._send_json(500, {"error": "release-info 与实际制品不一致",
-                                  "declared": declared, "actual": actual})
+            info = release_info(self.payload_root)
+        except ReleaseInfoError as exc:
+            self._send_json(500, exc.payload)
             return
         self._send_json(200, {
             "release_id": info.get("release_id"),
             "source_sha": info.get("source_sha"),
-            "artifact_digest": declared,
+            "artifact_digest": info.get("artifact_digest"),
             "built_at": info.get("built_at"),
+        })
+
+    def _handle_buildinfo(self):
+        try:
+            info = release_info(self.payload_root)
+        except ReleaseInfoError as exc:
+            # api.md 契约：缺失/不可解析 → 约定错误对象；其余失败类保持
+            # 详细 payload；/version 的响应映射不受此分支影响
+            if exc.unavailable:
+                self._send_json_sorted(500, BUILDINFO_UNAVAILABLE_ERROR)
+            else:
+                self._send_json(500, exc.payload)
+            return
+        self._send_json_sorted(200, {
+            "release_id": info.get("release_id"),
+            "source_sha": info.get("source_sha"),
+            "built_at": info.get("built_at"),
+            "service_start_iso": SERVICE_START.isoformat(),
+            "uptime_seconds": _uptime_seconds(datetime.now(timezone.utc)),
+            "python_version": platform.python_version(),
         })
 
     def _not_found(self):
@@ -120,6 +191,8 @@ class VersionRequestHandler(BaseHTTPRequestHandler):
             self._send(200, b"ok", "text/plain; charset=utf-8")
         elif path == "/version":
             self._handle_version()
+        elif path == "/buildinfo":
+            self._handle_buildinfo()
         else:
             self._not_found()
 
