@@ -11,7 +11,9 @@
   GET /buildinfo → 200 JSON {release_id, source_sha, built_at} 加运行时字段
                   {service_start_iso, uptime_seconds, python_version}；三元组
                   与 /version 共用同一 release_info() 读取/自校验路径（缺失/
-                  不可解析/摘要不符同口径 → 500），键按字母序紧凑输出
+                  不可解析/摘要不符同口径 → 500，其中缺失/不可解析按 api.md
+                  返回约定错误对象，/version 仍回原详细错误对象），键按字母序
+                  紧凑输出
   其他路径/方法 → 404
 
 摘要口径与 tools/build_artifact.py、entry/relay_trusted_entry.py 一致：
@@ -37,6 +39,8 @@ MANIFEST_SCHEMA = "relay-artifact-manifest/1"
 MANIFEST_EXCLUDE = {"MANIFEST.json", "release-info.json"}
 DEFAULT_PORT = 18080
 DEFAULT_HOST = "127.0.0.1"
+# api.md：/buildinfo 对 release-info.json 缺失/不可解析返回的约定错误对象
+BUILDINFO_UNAVAILABLE_ERROR = {"error": "release-info unavailable"}
 # payload 根 = src/ 的上级目录（仓库内运行即仓库根；容器内即 /app）
 PAYLOAD_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 进程启动时刻（模块加载时一次采样，UTC）；/buildinfo 的 service_start_iso/
@@ -77,11 +81,17 @@ def load_release_info(payload_root):
 
 
 class ReleaseInfoError(Exception):
-    """release-info 读取/自校验失败；payload 即 500 响应的 JSON 对象。"""
+    """release-info 读取/自校验失败；payload 即 500 响应的 JSON 对象。
 
-    def __init__(self, payload):
+    unavailable=True 标记缺失/不可解析一类：api.md 规定 /buildinfo 对此类
+    返回约定错误对象 BUILDINFO_UNAVAILABLE_ERROR，/version 与其余失败类
+    （非对象/摘要不符）仍回详细 payload，原行为不变。
+    """
+
+    def __init__(self, payload, unavailable=False):
         super().__init__(payload.get("error", "release-info 不可用"))
         self.payload = payload
+        self.unavailable = unavailable
 
 
 def release_info(payload_root):
@@ -94,7 +104,8 @@ def release_info(payload_root):
         info = load_release_info(payload_root)
     except (OSError, ValueError) as exc:
         raise ReleaseInfoError(
-            {"error": "release-info.json 不可用: " + str(exc)}) from exc
+            {"error": "release-info.json 不可用: " + str(exc)},
+            unavailable=True) from exc
     if not isinstance(info, dict):
         raise ReleaseInfoError({"error": "release-info.json 不是 JSON 对象"})
     try:
@@ -155,7 +166,12 @@ class VersionRequestHandler(BaseHTTPRequestHandler):
         try:
             info = release_info(self.payload_root)
         except ReleaseInfoError as exc:
-            self._send_json(500, exc.payload)
+            # api.md 契约：缺失/不可解析 → 约定错误对象；其余失败类保持
+            # 详细 payload；/version 的响应映射不受此分支影响
+            if exc.unavailable:
+                self._send_json_sorted(500, BUILDINFO_UNAVAILABLE_ERROR)
+            else:
+                self._send_json(500, exc.payload)
             return
         self._send_json_sorted(200, {
             "release_id": info.get("release_id"),

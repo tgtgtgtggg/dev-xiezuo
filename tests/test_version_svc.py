@@ -12,7 +12,8 @@
   * /buildinfo（TestBuildinfoEndpoint）：200 六字段完整且类型正确
     （service_start_iso 可解析 UTC、uptime_seconds 非负 int、
     python_version 非空）、键字母序紧凑输出、启动时刻一次采样且
-    uptime 每请求实算、缺 release-info/坏 JSON/非对象/篡改→500、
+    uptime 每请求实算、缺 release-info/坏 JSON → 500 且响应体为 api.md
+    约定错误对象 {"error": "release-info unavailable"}、非对象/篡改→500、
     未知路径与非 GET 方法→404、不落盘。
 """
 import hashlib
@@ -243,6 +244,16 @@ class RouteTests(unittest.TestCase):
         status, _headers, _body = self._request("/version")
         self.assertEqual(status, 500)
 
+    def test_version_error_body_keeps_original_detail(self):
+        # F-1 修复边界守护：仅 /buildinfo 归一为 api.md 约定错误对象，
+        # /version 保留原有详细错误 payload（含底层异常信息）
+        os.remove(os.path.join(self.payload_root, "release-info.json"))
+        status, _headers, body = self._request("/version")
+        self.assertEqual(status, 500)
+        data = json.loads(body.decode("utf-8"))
+        self.assertNotEqual(data, {"error": "release-info unavailable"})
+        self.assertTrue(data["error"].startswith("release-info.json 不可用"))
+
     def test_version_unparseable_release_info_returns_500(self):
         target = os.path.join(self.payload_root, "release-info.json")
         with open(target, "wb") as fh:
@@ -363,15 +374,22 @@ class TestBuildinfoEndpoint(unittest.TestCase):
 
     def test_buildinfo_missing_release_info_returns_500(self):
         os.remove(os.path.join(self.payload_root, "release-info.json"))
-        status, _headers, _body = self._request("/buildinfo")
+        status, headers, body = self._request("/buildinfo")
         self.assertEqual(status, 500)
+        self.assertEqual(headers.get_content_type(), "application/json")
+        # api.md 契约：完整响应对象断言（dict 相等即同时排除多余键）
+        self.assertEqual(json.loads(body.decode("utf-8")),
+                         {"error": "release-info unavailable"})
 
     def test_buildinfo_unparseable_release_info_returns_500(self):
         target = os.path.join(self.payload_root, "release-info.json")
         with open(target, "wb") as fh:
             fh.write('{"release_id": 缺引号}'.encode("utf-8"))
-        status, _headers, _body = self._request("/buildinfo")
+        status, headers, body = self._request("/buildinfo")
         self.assertEqual(status, 500)
+        self.assertEqual(headers.get_content_type(), "application/json")
+        self.assertEqual(json.loads(body.decode("utf-8")),
+                         {"error": "release-info unavailable"})
 
     def test_buildinfo_non_object_release_info_returns_500(self):
         target = os.path.join(self.payload_root, "release-info.json")
