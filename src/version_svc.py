@@ -3,7 +3,8 @@
 """src/version_svc.py — relay 试点版本服务（纯标准库，DEV-33 sample-app 同构）。
 
 路由：
-  GET /health   → 200 "ok"（不触碰版本文件——健康即进程可服务）
+  GET /health   → 200 "ok"（健康即进程可服务——版本文件缺失/损坏不影响
+                  状态码与响应体）
   GET /version  → 200 JSON {release_id, source_sha, artifact_digest, built_at}
                   版本证据只读 payload 根 release-info.json，且每次请求对
                   payload 根重算 content-manifest 摘要自校验，不符 → 500
@@ -15,6 +16,11 @@
                   返回约定错误对象，/version 仍回原详细错误对象），键按字母序
                   紧凑输出
   其他路径/方法 → 404
+
+响应头 X-Relay-Release：仅 /health 与 /version 的 200 成功分支追加，值为
+该次请求 release_info() 读取到的 release_id；500/404 分支与 /buildinfo
+不追加。/health 仍不因版本文件失败而降级——release_info() 失败时照旧
+200 "ok"，只是不带该头。
 
 摘要口径与 tools/build_artifact.py、entry/relay_trusted_entry.py 一致：
 排除 {MANIFEST.json, release-info.json} + 隐藏文件 + __pycache__，规范化
@@ -41,6 +47,7 @@ DEFAULT_PORT = 18080
 DEFAULT_HOST = "127.0.0.1"
 # api.md：/buildinfo 对 release-info.json 缺失/不可解析返回的约定错误对象
 BUILDINFO_UNAVAILABLE_ERROR = {"error": "release-info unavailable"}
+RELEASE_HEADER = "X-Relay-Release"
 # payload 根 = src/ 的上级目录（仓库内运行即仓库根；容器内即 /app）
 PAYLOAD_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 进程启动时刻（模块加载时一次采样，UTC）；/buildinfo 的 service_start_iso/
@@ -121,6 +128,19 @@ def release_info(payload_root):
     return info
 
 
+def _release_header_value(info):
+    """X-Relay-Release 头值；release_id 不能安全入头时返回 None（省略该头）。
+
+    非字符串（JSON null/数字）、空串、含控制字符或非 ASCII 的值若直接
+    send_header 会注入响应头或在编码时抛异常，破坏原本成功的 200 响应。
+    """
+    release_id = info.get("release_id") if info else None
+    if (isinstance(release_id, str) and release_id
+            and release_id.isascii() and release_id.isprintable()):
+        return release_id
+    return None
+
+
 def _uptime_seconds(now):
     """相对 SERVICE_START 的整数秒（每请求实算；时钟回拨钳 0）。"""
     return max(0, int((now - SERVICE_START).total_seconds()))
@@ -130,24 +150,37 @@ class VersionRequestHandler(BaseHTTPRequestHandler):
     server_version = "relay-pilot-version-svc/1.0"
     payload_root = PAYLOAD_ROOT  # build_payload_root 工厂按注入覆盖
 
-    def _send(self, code, body, ctype):
+    def _send(self, code, body, ctype, release_header=None):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-cache")
+        if release_header is not None:
+            self.send_header(RELEASE_HEADER, release_header)
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
 
-    def _send_json(self, code, obj):
+    def _send_json(self, code, obj, release_header=None):
         self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"),
-                   "application/json; charset=utf-8")
+                   "application/json; charset=utf-8",
+                   release_header=release_header)
 
     def _send_json_sorted(self, code, obj):
         # /buildinfo 200 口径：键字母序 + 紧凑分隔；/version 序列化保持不变
         self._send(code, json.dumps(obj, ensure_ascii=False, sort_keys=True,
                                     separators=(",", ":")).encode("utf-8"),
                    "application/json; charset=utf-8")
+
+    def _handle_health(self):
+        # 健康即进程可服务：版本证据的任何失败（含 release_info 未兜住的
+        # RecursionError 等）都不改变 200 "ok"，只是不带版本头
+        try:
+            info = release_info(self.payload_root)
+        except Exception:
+            info = None
+        self._send(200, b"ok", "text/plain; charset=utf-8",
+                   release_header=_release_header_value(info))
 
     def _handle_version(self):
         try:
@@ -160,7 +193,7 @@ class VersionRequestHandler(BaseHTTPRequestHandler):
             "source_sha": info.get("source_sha"),
             "artifact_digest": info.get("artifact_digest"),
             "built_at": info.get("built_at"),
-        })
+        }, release_header=_release_header_value(info))
 
     def _handle_buildinfo(self):
         try:
@@ -188,7 +221,7 @@ class VersionRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         if path == "/health":
-            self._send(200, b"ok", "text/plain; charset=utf-8")
+            self._handle_health()
         elif path == "/version":
             self._handle_version()
         elif path == "/buildinfo":
