@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 """tests/integration/test_version_integration.py — 版本服务集成冒烟。
 
-以子进程真实起服验证 GET /health 与 GET /version：
+以子进程真实起服验证 GET /health、GET /version 与 GET /buildinfo：
 payload 布局与真实制品一致（payload 根 = src/ 上级，release-info.json
 在 payload 根上，artifact_digest 为构建侧口径的摘要），argv 传端口。
 本目录是 required 检查 integration 的 discover 起点。
 """
 import json
 import os
+import platform
 import shutil
 import socket
 import subprocess
@@ -18,6 +19,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))            # tests/integration
 REPO_ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -41,11 +43,10 @@ def _free_port():
 
 class VersionSvcIntegrationSmoke(unittest.TestCase):
 
-    def test_health_and_version_over_real_subprocess(self):
+    def _make_payload(self):
+        """真实制品布局的临时 payload 根：src/version_svc.py + release-info.json。"""
         payload_root = tempfile.mkdtemp(prefix="version-svc-it-")
         self.addCleanup(shutil.rmtree, payload_root, ignore_errors=True)
-
-        # 真实制品布局：payload 根含 src/version_svc.py 与 release-info.json
         os.makedirs(os.path.join(payload_root, "src"))
         shutil.copy2(os.path.join(SRC_DIR, "version_svc.py"),
                      os.path.join(payload_root, "src", "version_svc.py"))
@@ -60,7 +61,10 @@ class VersionSvcIntegrationSmoke(unittest.TestCase):
             json.dump(release_info, fh, ensure_ascii=False, indent=2,
                       sort_keys=True)
             fh.write("\n")
+        return payload_root, release_info
 
+    def _start_subprocess(self, payload_root):
+        """argv 起服并等待就绪，返回 base_url（退出清理已注册）。"""
         port = _free_port()
         base_url = "http://127.0.0.1:%d" % port
         log_file = tempfile.TemporaryFile(mode="w+b")  # 子进程 stderr 诊断用
@@ -71,8 +75,12 @@ class VersionSvcIntegrationSmoke(unittest.TestCase):
              os.path.join(payload_root, "src", "version_svc.py"), str(port)],
             stdout=subprocess.DEVNULL, stderr=log_file, env=env)
         self.addCleanup(self._terminate, proc)
-
         self._wait_ready(base_url + "/health", proc, log_file)
+        return base_url
+
+    def test_health_and_version_over_real_subprocess(self):
+        _payload_root, release_info = self._make_payload()
+        base_url = self._start_subprocess(_payload_root)
 
         with _OPENER.open(base_url + "/health", timeout=5) as resp:
             self.assertEqual(resp.status, 200)
@@ -84,6 +92,45 @@ class VersionSvcIntegrationSmoke(unittest.TestCase):
                              "application/json; charset=utf-8")
             self.assertEqual(json.loads(resp.read().decode("utf-8")),
                              release_info)
+
+    def test_buildinfo_over_real_subprocess(self):
+        _payload_root, release_info = self._make_payload()
+        base_url = self._start_subprocess(_payload_root)
+
+        with _OPENER.open(base_url + "/buildinfo", timeout=5) as resp:
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(resp.getheader("Content-Type"),
+                             "application/json; charset=utf-8")
+            raw = resp.read()
+        data = json.loads(raw.decode("utf-8"))
+        # 键字母序 + 紧凑分隔（logic.md 序列化口径）
+        self.assertEqual(list(data), sorted(data))
+        self.assertEqual(raw, json.dumps(data, ensure_ascii=False,
+                                         sort_keys=True,
+                                         separators=(",", ":")).encode("utf-8"))
+        # 三元组与 release-info 同源，python_version 与子进程解释器一致
+        self.assertEqual(data["release_id"], release_info["release_id"])
+        self.assertEqual(data["source_sha"], release_info["source_sha"])
+        self.assertEqual(data["built_at"], release_info["built_at"])
+        self.assertEqual(data["python_version"], platform.python_version())
+        self.assertTrue(data["python_version"])
+        # service_start_iso 可解析 UTC；子进程刚起步，启动时刻贴近当前时间
+        started = datetime.fromisoformat(data["service_start_iso"])
+        self.assertEqual(started.utcoffset(), timedelta(0))
+        skew = (datetime.now(timezone.utc) - started).total_seconds()
+        self.assertGreaterEqual(skew, 0.0)
+        self.assertLessEqual(skew, 60.0)
+        # uptime_seconds 非负 int（bool 是 int 子类，需显式排除）
+        self.assertIsInstance(data["uptime_seconds"], int)
+        self.assertNotIsInstance(data["uptime_seconds"], bool)
+        self.assertGreaterEqual(data["uptime_seconds"], 0)
+        self.assertLess(data["uptime_seconds"], 60)
+
+        # 启动时刻一次采样：再次请求 service_start_iso 不变，uptime 不减
+        with _OPENER.open(base_url + "/buildinfo", timeout=5) as resp:
+            again = json.loads(resp.read().decode("utf-8"))
+        self.assertEqual(again["service_start_iso"], data["service_start_iso"])
+        self.assertGreaterEqual(again["uptime_seconds"], data["uptime_seconds"])
 
     def _wait_ready(self, health_url, proc, log_file):
         deadline = time.monotonic() + READY_TIMEOUT_SECONDS

@@ -9,18 +9,26 @@
     /health 200 ok（不依赖 release-info）、/version 200 三元组、
     篡改→500、缺 release-info→500、不可解析→500、非对象→500、
     其余路径→404、非 GET 方法→404、服务不落盘任何文件。
+  * /buildinfo（TestBuildinfoEndpoint）：200 六字段完整且类型正确
+    （service_start_iso 可解析 UTC、uptime_seconds 非负 int、
+    python_version 非空）、键字母序紧凑输出、启动时刻一次采样且
+    uptime 每请求实算、缺 release-info/坏 JSON/非对象/篡改→500、
+    未知路径与非 GET 方法→404、不落盘。
 """
 import hashlib
 import importlib.util
 import json
 import os
+import platform
 import shutil
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -272,6 +280,139 @@ class RouteTests(unittest.TestCase):
         for path in ("/health", "/version", "/nope"):
             self._request(path)
         self.assertEqual(_list_files(self.payload_root), before)
+
+
+class TestBuildinfoEndpoint(unittest.TestCase):
+    """/buildinfo（api.md：200 六字段；失败与 /version 同口径 500）。"""
+
+    EXPECTED_KEYS = ["built_at", "python_version", "release_id",
+                     "service_start_iso", "source_sha", "uptime_seconds"]
+
+    def setUp(self):
+        self.payload_root = tempfile.mkdtemp(prefix="version-svc-buildinfo-")
+        _make_payload_tree(self.payload_root)
+        digest = _reference_digest(self.payload_root)
+        self.release_info = _write_release_info(self.payload_root, digest)
+        self.server = ThreadingHTTPServer(
+            ("127.0.0.1", 0), version_svc.build_payload_root(self.payload_root))
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       daemon=True)
+        self.thread.start()
+        self.addCleanup(shutil.rmtree, self.payload_root, ignore_errors=True)
+        self.addCleanup(self._stop_server)
+
+    def _stop_server(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+    def _request(self, path, method="GET"):
+        request = urllib.request.Request(
+            "http://127.0.0.1:%d%s" % (self.port, path), method=method)
+        try:
+            with _OPENER.open(request, timeout=10) as resp:
+                return resp.status, resp.headers, resp.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.headers, exc.read()
+
+    def _get_buildinfo(self):
+        status, headers, body = self._request("/buildinfo")
+        self.assertEqual(status, 200)
+        return headers, body
+
+    def test_buildinfo_returns_full_typed_fields(self):
+        headers, body = self._get_buildinfo()
+        self.assertEqual(headers.get_content_type(), "application/json")
+        data = json.loads(body.decode("utf-8"))
+        self.assertEqual(sorted(data), self.EXPECTED_KEYS)
+        # 三元组与 /version 同源同字段名（值直接来自 release-info.json）
+        self.assertEqual(data["release_id"], self.release_info["release_id"])
+        self.assertEqual(data["source_sha"], self.release_info["source_sha"])
+        self.assertEqual(data["built_at"], self.release_info["built_at"])
+        # service_start_iso 可解析且为 UTC，且不晚于当前时刻
+        started = datetime.fromisoformat(data["service_start_iso"])
+        self.assertEqual(started.utcoffset(), timedelta(0))
+        self.assertLessEqual(started, datetime.now(timezone.utc))
+        # uptime_seconds 非负 int（bool 是 int 子类，需显式排除）
+        self.assertIsInstance(data["uptime_seconds"], int)
+        self.assertNotIsInstance(data["uptime_seconds"], bool)
+        self.assertGreaterEqual(data["uptime_seconds"], 0)
+        # python_version 非空且与运行解释器一致
+        self.assertEqual(data["python_version"], platform.python_version())
+        self.assertTrue(data["python_version"])
+
+    def test_buildinfo_body_is_sorted_compact_json(self):
+        _headers, body = self._get_buildinfo()
+        data = json.loads(body.decode("utf-8"))
+        self.assertEqual(list(data), sorted(data))
+        self.assertEqual(
+            body, json.dumps(data, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":")).encode("utf-8"))
+
+    def test_buildinfo_start_sampled_once_and_uptime_recomputed(self):
+        _headers, first_body = self._get_buildinfo()
+        first = json.loads(first_body.decode("utf-8"))
+        time.sleep(1.1)  # 跨整数秒边界，验证 uptime 每请求实算而非缓存
+        _headers, second_body = self._get_buildinfo()
+        second = json.loads(second_body.decode("utf-8"))
+        self.assertEqual(second["service_start_iso"],
+                         first["service_start_iso"])
+        self.assertGreaterEqual(second["uptime_seconds"],
+                                first["uptime_seconds"] + 1)
+
+    def test_buildinfo_missing_release_info_returns_500(self):
+        os.remove(os.path.join(self.payload_root, "release-info.json"))
+        status, _headers, _body = self._request("/buildinfo")
+        self.assertEqual(status, 500)
+
+    def test_buildinfo_unparseable_release_info_returns_500(self):
+        target = os.path.join(self.payload_root, "release-info.json")
+        with open(target, "wb") as fh:
+            fh.write('{"release_id": 缺引号}'.encode("utf-8"))
+        status, _headers, _body = self._request("/buildinfo")
+        self.assertEqual(status, 500)
+
+    def test_buildinfo_non_object_release_info_returns_500(self):
+        target = os.path.join(self.payload_root, "release-info.json")
+        with open(target, "wb") as fh:
+            fh.write(b"[1, 2]")
+        status, _headers, _body = self._request("/buildinfo")
+        self.assertEqual(status, 500)
+
+    def test_buildinfo_tampered_payload_returns_500(self):
+        with open(os.path.join(self.payload_root, "app.py"), "ab") as fh:
+            fh.write(b"# tampered\n")
+        status, _headers, _body = self._request("/buildinfo")
+        self.assertEqual(status, 500)
+
+    def test_buildinfo_unknown_paths_return_404(self):
+        for path in ("/buildinfo/", "/buildinfox", "/build/info",
+                     "/buildinfo/extra"):
+            status, _headers, _body = self._request(path)
+            self.assertEqual(status, 404, path)
+
+    def test_buildinfo_non_get_methods_return_404(self):
+        for method in ("POST", "PUT", "DELETE", "HEAD", "OPTIONS", "FOOBAR"):
+            status, _headers, body = self._request("/buildinfo", method=method)
+            self.assertEqual(status, 404, method)
+            if method != "HEAD":  # HEAD 按 RFC 不携带响应体
+                self.assertEqual(body, b"not found", method)
+
+    def test_buildinfo_writes_no_files(self):
+        before = _list_files(self.payload_root)
+        self._request("/buildinfo")
+        self.assertEqual(_list_files(self.payload_root), before)
+
+    def test_uptime_helper_truncates_and_clamps_clock_rollback(self):
+        start = version_svc.SERVICE_START
+        self.assertEqual(version_svc._uptime_seconds(start), 0)
+        # int 截断：1.9 秒 → 1
+        self.assertEqual(version_svc._uptime_seconds(
+            start + timedelta(seconds=1, microseconds=900000)), 1)
+        # 时钟回拨钳 0
+        self.assertEqual(version_svc._uptime_seconds(
+            start - timedelta(seconds=30)), 0)
 
 
 class MainArgvTests(unittest.TestCase):
